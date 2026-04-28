@@ -15,6 +15,30 @@ class Base(BaseModel):
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
+class TranscriptionConfig(Base):
+    """Voice-to-text transcription configuration.
+
+    Supports cloud providers (Groq, OpenAI) and local Whisper-compatible
+    servers (whisper.cpp, faster-whisper, LocalAI, Ollama).
+
+    Local setup example (config.json)::
+
+        "transcription": {
+            "provider": "local",
+            "api_base": "http://localhost:8080/v1/audio/transcriptions",
+            "model": "large-v3"
+        }
+    """
+
+    enabled: bool = True
+    provider: str = "groq"  # groq, openai, local
+    model: str | None = None  # None = provider default (whisper-large-v3 for groq, whisper-1 for openai)
+    api_key: str | None = None  # None = falls back to provider section key; not required for local
+    api_base: str | None = None  # Required for local; override URL for cloud providers
+    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # ISO-639-1 hint
+    max_duration_seconds: int = Field(default=300, ge=10)  # Reject very long audio
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels.
 
@@ -28,7 +52,10 @@ class ChannelsConfig(Base):
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
-    transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
+    transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
+    # Legacy flat fields — kept for backward compat, mapped to TranscriptionConfig in manager
+    transcription_provider: str = "groq"  # Voice transcription backend: "groq", "openai", or "local"
+    transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Optional ISO-639-1 hint for audio transcription
 
 
 class DreamConfig(Base):
@@ -43,7 +70,12 @@ class DreamConfig(Base):
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
     )  # Optional Dream-specific model override
     max_batch_size: int = Field(default=20, ge=1)  # Max history entries per run
-    max_iterations: int = Field(default=10, ge=1)  # Max tool calls per Phase 2
+    # Bumped from 10 to 15 in #3212 (exp002: +30% dedup, no accuracy loss; >15 plateaus).
+    max_iterations: int = Field(default=15, ge=1)  # Max tool calls per Phase 2
+    # Per-line git-blame age annotation in Phase 1 prompt (see #3212). Default
+    # on — set to False to feed MEMORY.md raw if a specific LLM reacts poorly
+    # to the `← Nd` suffix or you want deterministic, git-independent prompts.
+    annotate_line_ages: bool = True
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
@@ -84,6 +116,13 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
+    consolidation_ratio: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=0.95,
+        validation_alias=AliasChoices("consolidationRatio"),
+        serialization_alias="consolidationRatio",
+    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
@@ -314,17 +353,15 @@ class Config(BaseSettings):
         return p.api_key if p else None
 
     def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for gateway/local providers."""
+        """Get API base URL for the given model, falling back to the provider default when present."""
         from nanobot.providers.registry import find_by_name
 
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # resolve their base URL from the registry in the provider constructor.
         if name:
             spec = find_by_name(name)
-            if spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:
+            if spec and spec.default_api_base:
                 return spec.default_api_base
         return None
 
